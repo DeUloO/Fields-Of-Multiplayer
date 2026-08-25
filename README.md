@@ -8,4 +8,5 @@ loaded into the game using MOMI(MMAPI) https://github.com/Garethp/Mods-of-Mistri
 The relay is necessary since the GML code is running on a GM VM (Fabricator https://github.com/kyren/fabricator/) in which the only way to communicate outside is through writing to and reading from the same folder as where the game puts its saves folder and crash logs.
 
 Any and all contributions and bug fixes are welcome, you may add your name to the manifest.json if you so wish.
-As a general rule: People will NOT be added to the Nexus mod as contributors due to safety concerns (since I am telling people to use a .exe file).
+As a general rule: People will NOT be added to the Nexus mod as contributors due to safety concerns (since I am telling people to use a .exe file and I'd not feel comfortable having other people have access to that).
+Right now I do get DP from the mod, I'll change that to a random charity/when someone commits for the first time you can say which charity you'd like the DP to go towards and I'll change where the DP go towards based on that/where the most ppl want it to go towards :D
