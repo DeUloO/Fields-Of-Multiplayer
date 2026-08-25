@@ -1,0 +1,12 @@
+{
+    "name": "Multiplayer",
+    "author": "DeUlo",
+    "version": "0.3.3",
+    "minInstallerVersion": "0.14.0",
+    "manifestVersion": 1,
+    "requires_hooks": [
+        "ui.menu_opened",
+        "ui.menu_closed",
+        "local.missing"
+    ]
+}
