@@ -43,6 +43,10 @@ function mp_reset_session_state() {
     global.mp_recv_pickup  = {};
     global.mp_picked_up    = {};
     global.mp_client_epoch = mp_generate_client_epoch();
+    global.mp_outbox_pending    = [];
+    global.mp_outbox_seg_seq    = 0;
+    global.mp_outbox_seg_init   = false;
+    global.mp_applied_relay_seq = 0;
     show_debug_message("[MOMI-MP] session state reset (ghosts + diff baselines cleared)");
 }
 
@@ -99,6 +103,9 @@ function mp_tick() {
     mp_scan_grid();
     mp_scan_items();
     mp_scan_animals();
+    mp_outbox_flush();
+    mp_outbox_prune_acked();
+    mp_inbox_process();
     mp_write_state();
     mp_read_state();
 }

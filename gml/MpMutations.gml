@@ -10,9 +10,14 @@ global.mp_animal_prev  = {};
 global.mp_bldg_out     = {};
 global.mp_crop_prev    = {};
 global.mp_client_epoch = undefined;
+global.mp_outbox_pending    = [];
+global.mp_outbox_seg_seq    = 0;
+global.mp_outbox_seg_init   = false;
+global.mp_applied_relay_seq = 0;
 
 #macro MP_EV_HISTORY 320
 #macro MP_PROTOCOL_VERSION 2
+#macro MP_OUTBOX_MAX_BATCH 200
 
 // Fresh per boot/session-reset identity; invalidates stale clientSeq after a restart.
 function mp_generate_client_epoch() {
@@ -33,6 +38,174 @@ function mp_client_epoch() {
 
 function mp_make_event_id(pid, client_seq) {
     return string(pid) + ":" + string(mp_client_epoch()) + ":" + string(client_seq);
+}
+
+function mp_player_id() {
+    return string(ARI.name) + "|" + string(ARI.farm_name);
+}
+
+// Placeholder world/session identity until host and joiners share a real handshake-negotiated id.
+function mp_session_id() {
+    return mp_player_id();
+}
+
+function mp_zero_pad(n, width) {
+    var s = string(n);
+    while (string_length(s) < width) { s = "0" + s; }
+    return s;
+}
+
+function mp_outbox_dir() {
+    var d = mp_dir() + "/outbox";
+    directory_create(d);
+    return d;
+}
+
+function mp_inbox_dir() {
+    var d = mp_dir() + "/inbox";
+    directory_create(d);
+    return d;
+}
+
+// Restart-safe: resumes numbering past any segments a previous run left un-acked on disk.
+function mp_outbox_init_segment_seq() {
+    if global.mp_outbox_seg_init { return; }
+    global.mp_outbox_seg_init = true;
+
+    var max_seq = 0;
+    var fname = file_find_first(mp_outbox_dir() + "/segment-*.json", 0);
+    while (fname != "") {
+        var digits = string_copy(fname, 9, 6);
+        var n = real(digits);
+        if n > max_seq { max_seq = n; }
+        fname = file_find_next();
+    }
+    file_find_close();
+    global.mp_outbox_seg_seq = max_seq;
+}
+
+// Durably queues one envelope for the next flush; nothing is lost until it lands on disk.
+function mp_outbox_enqueue(envelope) {
+    array_push(global.mp_outbox_pending, envelope);
+}
+
+// Writes pending envelopes as one new immutable segment file (array-of-envelopes JSON).
+function mp_outbox_flush() {
+    mp_outbox_init_segment_seq();
+    if array_length(global.mp_outbox_pending) == 0 { return; }
+
+    global.mp_outbox_seg_seq++;
+    var name = "segment-" + mp_zero_pad(global.mp_outbox_seg_seq, 6) + ".json";
+    var path = mp_outbox_dir() + "/" + name;
+
+    try {
+        save_json_file(path, global.mp_outbox_pending);
+        global.mp_outbox_pending = [];
+    } catch (e) {
+        show_debug_message("[MOMI-MP] outbox flush failed: " + string(e));
+    }
+}
+
+// Deletes segments the relay has durably accepted; safe because acks only move forward.
+function mp_outbox_prune_acked() {
+    var ack = try_read_json_file(mp_outbox_dir() + "/producer-ack.json");
+    if ack == undefined || ack[$ "acceptedThroughClientSeq"] == undefined { return; }
+    var accepted_through = ack.acceptedThroughClientSeq;
+
+    var dir = mp_outbox_dir();
+    var names = [];
+    var fname = file_find_first(dir + "/segment-*.json", 0);
+    while (fname != "") {
+        array_push(names, fname);
+        fname = file_find_next();
+    }
+    file_find_close();
+    array_sort(names, true);
+
+    for (var i = 0; i < array_length(names); i++) {
+        var path = dir + "/" + names[i];
+        var entries = try_read_json_file(path);
+        if entries == undefined || array_length(entries) == 0 { continue; }
+        var last_client_seq = entries[array_length(entries) - 1][$ "clientSeq"];
+        if last_client_seq == undefined || last_client_seq > accepted_through { break; }
+        try { file_delete(path); } catch (e) { }
+    }
+}
+
+// Applies one canonical envelope; mirrors mp_apply_player_events' per-kind dispatch.
+function mp_inbox_apply_envelope(envelope) {
+    var ev = envelope.event;
+    if ev.k == "astate" { return mp_apply_animal_state(ev); }
+    if ev.k == "bell"   { return mp_apply_bell(ev); }
+
+    if GRIDS == undefined { return false; }
+    var eloc = ev.loc;
+    if eloc < 0 || eloc >= array_length(GRIDS) { return true; } // location not tracked here; nothing to apply
+    var egrid = GRIDS[eloc];
+    if egrid == undefined { return true; }
+
+    var did = mp_apply_event(egrid, ev, eloc == CURRENT_LOCATION_ID);
+    return did;
+}
+
+function mp_inbox_read_cursor() {
+    var data = try_read_json_file(mp_inbox_dir() + "/applied-cursor.json");
+    if data == undefined || data[$ "lastAppliedRelaySeq"] == undefined { return 0; }
+    return data.lastAppliedRelaySeq;
+}
+
+function mp_inbox_write_cursor(relay_seq) {
+    global.mp_applied_relay_seq = relay_seq;
+    save_json_file(mp_inbox_dir() + "/applied-cursor.json", { lastAppliedRelaySeq: relay_seq });
+}
+
+// Applies exactly the batch contiguous with the persisted cursor; never skips a gap.
+function mp_inbox_process() {
+    var dir = mp_inbox_dir();
+    var cursor = mp_inbox_read_cursor();
+
+    var names = [];
+    var fname = file_find_first(dir + "/batch-*.json", 0);
+    while (fname != "") {
+        array_push(names, fname);
+        fname = file_find_next();
+    }
+    file_find_close();
+    array_sort(names, true);
+
+    var applied_any = false;
+    for (var i = 0; i < array_length(names); i++) {
+        var path = dir + "/" + names[i];
+        var batch = try_read_json_file(path);
+        if batch == undefined { continue; }
+
+        if batch[$ "toRelaySeq"] != undefined && batch.toRelaySeq <= cursor {
+            try { file_delete(path); } catch (e) { }
+            continue;
+        }
+        if batch[$ "fromRelaySeq"] == undefined || batch.fromRelaySeq != cursor + 1 {
+            continue; // gap or already applied elsewhere; wait for the correct next batch
+        }
+
+        var events = batch.events;
+        var ok = true;
+        for (var ei = 0; ei < array_length(events); ei++) {
+            if !mp_inbox_apply_envelope(events[ei]) { ok = false; break; }
+            cursor = events[ei].relaySeq;
+        }
+
+        mp_inbox_write_cursor(cursor);
+        applied_any = true;
+        if !ok { break; } // stop at the first failure; leaves the batch for repair/replay
+        try { file_delete(path); } catch (e) { }
+    }
+
+    if applied_any {
+        var post = mp_grid_snapshot();
+        global.mp_grid_prev    = post.nodes;
+        global.mp_terr_prev_gk = post.gk;
+        global.mp_terr_prev_w  = post.w;
+    }
 }
 
 function mp_grid_snapshot() {
@@ -218,6 +391,17 @@ function mp_emit_event(ev) {
     while (array_length(global.mp_ev_queue) > MP_EV_HISTORY) {
         array_delete(global.mp_ev_queue, 0, 1);
     }
+
+    var pid = mp_player_id();
+    mp_outbox_enqueue({
+        protocol:    MP_PROTOCOL_VERSION,
+        sessionId:   mp_session_id(),
+        playerId:    pid,
+        clientEpoch: mp_client_epoch(),
+        clientSeq:   global.mp_ev_seq,
+        eventId:     mp_make_event_id(pid, global.mp_ev_seq),
+        event:       ev,
+    });
 }
 
 function mp_emit_spawn(c) {
@@ -341,20 +525,23 @@ function mp_scan_animals() {
 }
 
 function mp_apply_bell(ev) {
+    var handled = false;
     with obj_farm_bell {
         if self[$ "node"] == undefined || self.node == undefined { continue; }
         if self.node.top_left_x != ev.btlx || self.node.top_left_y != ev.btly { continue; }
         if self.chain != undefined { continue; }
         try {
             if ev.out { self.bell_out(false); } else { self.bell_in(false); }
+            handled = true;
         } catch (e) {
             show_debug_message("[MOMI-MP] bell failed: " + string(e));
         }
     }
+    return handled;
 }
 
 function mp_apply_animal_state(ev) {
-    if GRIDS == undefined || GRIDS[LocationId.Farm] == undefined { return; }
+    if GRIDS == undefined || GRIDS[LocationId.Farm] == undefined { return true; } // farm not loaded; nothing to apply here
     var buildings = get_buildings();
     for (var bi = 0; bi < buildings.count(); bi++) {
         var b = buildings.get(bi);
@@ -375,9 +562,9 @@ function mp_apply_animal_state(ev) {
                     + string(ev.hpts) + "|" + string(ev[$ "prod"]);
                 if astate_current_sig == astate_new_sig {
                     global.mp_animal_prev[$ astate_key] = astate_current_sig;
-                    return;
+                    return true;
                 }
-                if astate_current_sig != ev.esig { return; }
+                if astate_current_sig != ev.esig { return false; }
             }
 
             an.has_been_pat     = ev.pat;
@@ -387,9 +574,10 @@ function mp_apply_animal_state(ev) {
             if ev[$ "prod"] != undefined { an.production_days = ev.prod; }
 
             global.mp_animal_prev[$ astate_key] = mp_animal_sig(an);
-            return;
+            return true;
         }
     }
+    return true; // target building/stall not present on this client; nothing to reconcile
 }
 
 function mp_apply_player_events(state) {
@@ -556,7 +744,7 @@ function mp_apply_event(grid, ev, is_current) {
             var cinv_new_sig = json_stringify(ev.inv);
             if cinv_current_sig == cinv_new_sig {
                 if is_current { global.mp_chest_prev[$ (string(ev.tx) + ":" + string(ev.ty))] = cinv_current_sig; }
-                return false;
+                return true;
             }
             if cinv_current_sig != ev.esig { return false; }
         }
@@ -574,8 +762,9 @@ function mp_apply_event(grid, ev, is_current) {
             }
         } catch (e) {
             show_debug_message("[MOMI-MP] cinv failed: " + string(e));
+            return false;
         }
-        return false;
+        return true;
     }
 
     if kind == "cstate" {
@@ -591,7 +780,7 @@ function mp_apply_event(grid, ev, is_current) {
                 + string((ev.mt == -1) ? undefined : ev.mt) + "|" + string(ev.cf);
             if cstate_current_sig == cstate_new_sig {
                 if is_current { global.mp_crop_prev[$ (string(ev.tx) + ":" + string(ev.ty))] = cstate_current_sig; }
-                return false;
+                return true;
             }
             if cstate_current_sig != ev.esig { return false; }
         }
@@ -620,7 +809,7 @@ function mp_apply_event(grid, ev, is_current) {
         if is_current {
             global.mp_crop_prev[$ (string(ev.tx) + ":" + string(ev.ty))] = mp_crop_sig(node);
         }
-        return false;
+        return true;
     }
 
     if kind == "tgk" {
@@ -645,19 +834,19 @@ function mp_apply_event(grid, ev, is_current) {
     if kind == "isp" {
         if !is_current {
 
-            if global.mp_picked_up[$ ev.g] != undefined { return false; }
+            if global.mp_picked_up[$ ev.g] != undefined { return true; }
             var llst = grid.lost_items;
             for (var li = 0; li < llst.count(); li++) {
                 var le = llst.get(li);
-                if floor(le.x) == floor(ev.x) && floor(le.y) == floor(ev.y) { return false; }
+                if floor(le.x) == floor(ev.x) && floor(le.y) == floor(ev.y) { return true; }
             }
             var abs_list = List();
             for (var ai = 0; ai < array_length(ev.its); ai++) {
                 abs_list.push(deserialize_live_item(ev.its[ai]));
             }
-            if abs_list.count() == 0 { return false; }
+            if abs_list.count() == 0 { return true; }
             llst.push({ x: ev.x, y: ev.y, items: abs_list });
-            return false;
+            return true;
         }
         var to_find = ev.g;
         var already = false;
@@ -668,20 +857,20 @@ function mp_apply_event(grid, ev, is_current) {
                 already = true;
             }
         }
-        if already { return false; }
+        if already { return true; }
 
         var live_list = List();
         for (var i = 0; i < array_length(ev.its); i++) {
             live_list.push(deserialize_live_item(ev.its[i]));
         }
-        if live_list.count() == 0 { return false; }
+        if live_list.count() == 0 { return true; }
 
         var inst = instance_create_layer(ev.x, ev.y, "Instances", obj_item);
         inst.mp_gid  = ev.g;
         inst.final_x = ev.x;
         inst.final_y = ev.y;
         inst.setup(live_list);
-        return false;
+        return true;
     }
 
     if kind == "ipk" {
@@ -705,7 +894,7 @@ function mp_apply_event(grid, ev, is_current) {
 
             global.mp_picked_up[$ ev.g] = true;
         }
-        return false;
+        return true;
     }
 
     return false;
