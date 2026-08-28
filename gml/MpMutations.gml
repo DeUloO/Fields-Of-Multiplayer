@@ -127,9 +127,12 @@ function mp_scan_grid() {
         if np[$ "inventory"] == undefined { continue; }
         var ckey = string(cc.tlx) + ":" + string(cc.tly);
         var sig  = mp_inventory_sig(np.inventory);
-        if global.mp_chest_prev[$ ckey] != sig {
+        var prev_sig = global.mp_chest_prev[$ ckey];
+        if prev_sig != sig {
             global.mp_chest_prev[$ ckey] = sig;
-            mp_emit_event({ k: "cinv", tx: cc.tlx, ty: cc.tly, oid: cc.oid, inv: np.inventory.serialize() });
+            var cinv_ev = { k: "cinv", tx: cc.tlx, ty: cc.tly, oid: cc.oid, inv: np.inventory.serialize() };
+            if prev_sig != undefined { cinv_ev.esig = prev_sig; }
+            mp_emit_event(cinv_ev);
         }
     }
 
@@ -140,9 +143,10 @@ function mp_scan_grid() {
         if object_id_to_object_category(pc.oid) != ObjectCategory.Crop { continue; }
         var pkey = string(pc.tlx) + ":" + string(pc.tly);
         var psig = mp_crop_sig(pn);
-        if global.mp_crop_prev[$ pkey] != psig {
+        var prev_crop_sig = global.mp_crop_prev[$ pkey];
+        if prev_crop_sig != psig {
             global.mp_crop_prev[$ pkey] = psig;
-            mp_emit_event({
+            var cstate_ev = {
                 k:  "cstate",
                 tx: pc.tlx, ty: pc.tly, oid: pc.oid,
                 st: pn.stage,
@@ -150,7 +154,9 @@ function mp_scan_grid() {
                 rc: pn.regrow_cycle,
                 mt: (pn[$ "managed_timer"] == undefined) ? -1 : pn.managed_timer,
                 cf: pn.ctx,
-            });
+            };
+            if prev_crop_sig != undefined { cstate_ev.esig = prev_crop_sig; }
+            mp_emit_event(cstate_ev);
         }
     }
 
@@ -289,10 +295,12 @@ function mp_scan_animals() {
             if global.mp_animal_prev[$ key] == undefined {
                 global.mp_animal_prev[$ key] = sig;
             } else if global.mp_animal_prev[$ key] != sig {
+                var prev_animal_sig = global.mp_animal_prev[$ key];
                 global.mp_animal_prev[$ key] = sig;
                 mp_emit_event({
                     k: "astate",
                     btlx: b.top_left_x, btly: b.top_left_y, oid: b.object_id, idx: an.idx,
+                    esig: prev_animal_sig,
                     pat: an.has_been_pat, eat: an.has_eaten, out: an.has_been_outside,
                     hpts: an.heart_points, prod: an[$ "production_days"],
                 });
@@ -336,13 +344,26 @@ function mp_apply_animal_state(ev) {
             var an = stalls.get(si);
             if an == undefined { continue; }
             if an.idx != ev.idx { continue; }
+
+            var astate_key = string(ev.btlx) + ":" + string(ev.btly) + ":" + string(ev.idx);
+            if ev[$ "esig"] != undefined {
+                var astate_current_sig = mp_animal_sig(an);
+                var astate_new_sig = string(ev.pat) + "|" + string(ev.eat) + "|" + string(ev.out) + "|"
+                    + string(ev.hpts) + "|" + string(ev[$ "prod"]);
+                if astate_current_sig == astate_new_sig {
+                    global.mp_animal_prev[$ astate_key] = astate_current_sig;
+                    return;
+                }
+                if astate_current_sig != ev.esig { return; }
+            }
+
             an.has_been_pat     = ev.pat;
             an.has_eaten        = ev.eat;
             an.has_been_outside = ev.out;
             an.heart_points     = ev.hpts;
             if ev[$ "prod"] != undefined { an.production_days = ev.prod; }
 
-            global.mp_animal_prev[$ (string(ev.btlx) + ":" + string(ev.btly) + ":" + string(ev.idx))] = mp_animal_sig(an);
+            global.mp_animal_prev[$ astate_key] = mp_animal_sig(an);
             return;
         }
     }
@@ -506,6 +527,17 @@ function mp_apply_event(grid, ev, is_current) {
         if node == undefined { return false; }
         if node[$ "inventory"] == undefined { return false; }
         if node.object_id != ev.oid { return false; }
+
+        if ev[$ "esig"] != undefined {
+            var cinv_current_sig = mp_inventory_sig(node.inventory);
+            var cinv_new_sig = json_stringify(ev.inv);
+            if cinv_current_sig == cinv_new_sig {
+                if is_current { global.mp_chest_prev[$ (string(ev.tx) + ":" + string(ev.ty))] = cinv_current_sig; }
+                return false;
+            }
+            if cinv_current_sig != ev.esig { return false; }
+        }
+
         try {
             node.inventory.deserialize(ev.inv);
 
@@ -529,6 +561,18 @@ function mp_apply_event(grid, ev, is_current) {
         var node = grid.node_parent[ni];
         if node == undefined { return false; }
         if node.object_id != ev.oid { return false; }
+
+        if ev[$ "esig"] != undefined {
+            var cstate_current_sig = mp_crop_sig(node);
+            var cstate_new_sig = string(ev.st) + "|" + string(ev.dc) + "|" + string(ev.rc) + "|"
+                + string((ev.mt == -1) ? undefined : ev.mt) + "|" + string(ev.cf);
+            if cstate_current_sig == cstate_new_sig {
+                if is_current { global.mp_crop_prev[$ (string(ev.tx) + ":" + string(ev.ty))] = cstate_current_sig; }
+                return false;
+            }
+            if cstate_current_sig != ev.esig { return false; }
+        }
+
         node.stage         = ev.st;
         node.day_count     = ev.dc;
         node.regrow_cycle  = ev.rc;
