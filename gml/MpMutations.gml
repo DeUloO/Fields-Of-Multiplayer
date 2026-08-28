@@ -109,7 +109,14 @@ function mp_scan_grid() {
             mp_emit_event({ k: "gone",  cx: p.cx, cy: p.cy, oid: p.oid });
             mp_emit_spawn(c);
         } else if c.hp != undefined && p.hp != undefined && p.hp > c.hp {
-            mp_emit_event({ k: "hit", cx: c.cx, cy: c.cy, oid: c.oid, dmg: p.hp - c.hp });
+            mp_emit_event({
+                k:   "hit",
+                cx:  c.cx,
+                cy:  c.cy,
+                oid: c.oid,
+                ehp: p.hp,
+                rhp: c.hp,
+            });
         }
     }
 
@@ -396,6 +403,8 @@ function mp_apply_event(grid, ev, is_current) {
     if ev[$ "oid"] != undefined && ev.oid == ObjectId.TurnInBox { return false; }
 
     if kind == "hit" {
+        if ev[$ "ehp"] == undefined || ev[$ "rhp"] == undefined { return false; }
+        if ev.ehp < 0 || ev.rhp < 0 || ev.rhp >= ev.ehp { return false; }
         var ni = grid.try_node_index_for_cell(ev.cx, ev.cy);
         if ni == undefined { return false; }
         if grid.node_object_id[ni] == undefined { return false; }
@@ -404,7 +413,9 @@ function mp_apply_event(grid, ev, is_current) {
 
         if node.object_id != ev.oid { return false; }
         if node[$ "hitpoints"] == undefined { return false; }
-        node.hitpoints -= min(ev.dmg, node.hitpoints);
+        if node.hitpoints == ev.rhp { return true; }
+        if node.hitpoints != ev.ehp { return false; }
+        node.hitpoints = ev.rhp;
         return true;
     }
 
