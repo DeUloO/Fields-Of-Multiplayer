@@ -42,6 +42,7 @@ function mp_reset_session_state() {
     global.mp_items_prev   = undefined;
     global.mp_recv_pickup  = {};
     global.mp_picked_up    = {};
+    global.mp_client_epoch = mp_generate_client_epoch();
     show_debug_message("[MOMI-MP] session state reset (ghosts + diff baselines cleared)");
 }
 

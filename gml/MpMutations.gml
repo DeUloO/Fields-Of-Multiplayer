@@ -9,8 +9,31 @@ global.mp_chest_prev   = {};
 global.mp_animal_prev  = {};
 global.mp_bldg_out     = {};
 global.mp_crop_prev    = {};
+global.mp_client_epoch = undefined;
 
 #macro MP_EV_HISTORY 320
+#macro MP_PROTOCOL_VERSION 2
+
+// Fresh per boot/session-reset identity; invalidates stale clientSeq after a restart.
+function mp_generate_client_epoch() {
+    var chars = "0123456789abcdef";
+    var out = "";
+    for (var i = 0; i < 16; i++) {
+        out += string_char_at(chars, irandom(15) + 1);
+    }
+    return out;
+}
+
+function mp_client_epoch() {
+    if global.mp_client_epoch == undefined {
+        global.mp_client_epoch = mp_generate_client_epoch();
+    }
+    return global.mp_client_epoch;
+}
+
+function mp_make_event_id(pid, client_seq) {
+    return string(pid) + ":" + string(mp_client_epoch()) + ":" + string(client_seq);
+}
 
 function mp_grid_snapshot() {
     var snap = { nodes: {}, gk: undefined, w: undefined };
