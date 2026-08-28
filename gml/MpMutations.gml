@@ -13,6 +13,7 @@ global.mp_client_epoch = undefined;
 global.mp_outbox_pending    = [];
 global.mp_outbox_seg_seq    = 0;
 global.mp_outbox_seg_init   = false;
+global.mp_outbox_segments   = [];
 global.mp_applied_relay_seq = 0;
 
 #macro MP_EV_HISTORY 320
@@ -67,21 +68,29 @@ function mp_inbox_dir() {
     return d;
 }
 
-// Restart-safe: resumes numbering past any segments a previous run left un-acked on disk.
-function mp_outbox_init_segment_seq() {
+function mp_outbox_state_path() {
+    return mp_outbox_dir() + "/state.json";
+}
+
+function mp_outbox_load_state() {
     if global.mp_outbox_seg_init { return; }
     global.mp_outbox_seg_init = true;
 
-    var max_seq = 0;
-    var fname = file_find_first(mp_outbox_dir() + "/segment-*.json", 0);
-    while (fname != "") {
-        var digits = string_copy(fname, 9, 6);
-        var n = real(digits);
-        if n > max_seq { max_seq = n; }
-        fname = file_find_next();
+    var data = try_read_json_file(mp_outbox_state_path());
+    if data == undefined {
+        global.mp_outbox_seg_seq   = 0;
+        global.mp_outbox_segments  = [];
+        return;
     }
-    file_find_close();
-    global.mp_outbox_seg_seq = max_seq;
+    global.mp_outbox_seg_seq  = (data[$ "nextSegmentSeq"] == undefined) ? 0 : data.nextSegmentSeq;
+    global.mp_outbox_segments = (data[$ "segments"] == undefined) ? [] : data.segments;
+}
+
+function mp_outbox_save_state() {
+    save_json_file(mp_outbox_state_path(), {
+        nextSegmentSeq: global.mp_outbox_seg_seq,
+        segments:       global.mp_outbox_segments,
+    });
 }
 
 // Durably queues one envelope for the next flush; nothing is lost until it lands on disk.
@@ -91,16 +100,19 @@ function mp_outbox_enqueue(envelope) {
 
 // Writes pending envelopes as one new immutable segment file (array-of-envelopes JSON).
 function mp_outbox_flush() {
-    mp_outbox_init_segment_seq();
+    mp_outbox_load_state();
     if array_length(global.mp_outbox_pending) == 0 { return; }
 
     global.mp_outbox_seg_seq++;
     var name = "segment-" + mp_zero_pad(global.mp_outbox_seg_seq, 6) + ".json";
     var path = mp_outbox_dir() + "/" + name;
+    var last_client_seq = global.mp_outbox_pending[array_length(global.mp_outbox_pending) - 1].clientSeq;
 
     try {
         save_json_file(path, global.mp_outbox_pending);
         global.mp_outbox_pending = [];
+        array_push(global.mp_outbox_segments, { name: name, maxClientSeq: last_client_seq });
+        mp_outbox_save_state();
     } catch (e) {
         show_debug_message("[MOMI-MP] outbox flush failed: " + string(e));
     }
@@ -108,27 +120,26 @@ function mp_outbox_flush() {
 
 // Deletes segments the relay has durably accepted; safe because acks only move forward.
 function mp_outbox_prune_acked() {
+    mp_outbox_load_state();
     var ack = try_read_json_file(mp_outbox_dir() + "/producer-ack.json");
     if ack == undefined || ack[$ "acceptedThroughClientSeq"] == undefined { return; }
     var accepted_through = ack.acceptedThroughClientSeq;
 
     var dir = mp_outbox_dir();
-    var names = [];
-    var fname = file_find_first(dir + "/segment-*.json", 0);
-    while (fname != "") {
-        array_push(names, fname);
-        fname = file_find_next();
+    var remaining = [];
+    var changed = false;
+    for (var i = 0; i < array_length(global.mp_outbox_segments); i++) {
+        var seg = global.mp_outbox_segments[i];
+        if seg.maxClientSeq <= accepted_through {
+            try { file_delete(dir + "/" + seg.name); } catch (e) { }
+            changed = true;
+        } else {
+            array_push(remaining, seg);
+        }
     }
-    file_find_close();
-    array_sort(names, true);
-
-    for (var i = 0; i < array_length(names); i++) {
-        var path = dir + "/" + names[i];
-        var entries = try_read_json_file(path);
-        if entries == undefined || array_length(entries) == 0 { continue; }
-        var last_client_seq = entries[array_length(entries) - 1][$ "clientSeq"];
-        if last_client_seq == undefined || last_client_seq > accepted_through { break; }
-        try { file_delete(path); } catch (e) { }
+    if changed {
+        global.mp_outbox_segments = remaining;
+        mp_outbox_save_state();
     }
 }
 
@@ -159,53 +170,36 @@ function mp_inbox_write_cursor(relay_seq) {
     save_json_file(mp_inbox_dir() + "/applied-cursor.json", { lastAppliedRelaySeq: relay_seq });
 }
 
-// Applies exactly the batch contiguous with the persisted cursor; never skips a gap.
+// Applies the pending batch only if it is exactly contiguous with the persisted cursor; never skips a gap.
+// A single fixed-name file is used the relay overwrites it
+// with the next range whenever the client's reported cursor advances past what it last published.
 function mp_inbox_process() {
-    var dir = mp_inbox_dir();
     var cursor = mp_inbox_read_cursor();
+    var path = mp_inbox_dir() + "/pending-batch.json";
+    var batch = try_read_json_file(path);
+    if batch == undefined { return; }
 
-    var names = [];
-    var fname = file_find_first(dir + "/batch-*.json", 0);
-    while (fname != "") {
-        array_push(names, fname);
-        fname = file_find_next();
+    if batch[$ "toRelaySeq"] != undefined && batch.toRelaySeq <= cursor {
+        return; // already applied; waiting for the relay to publish the next range
     }
-    file_find_close();
-    array_sort(names, true);
-
-    var applied_any = false;
-    for (var i = 0; i < array_length(names); i++) {
-        var path = dir + "/" + names[i];
-        var batch = try_read_json_file(path);
-        if batch == undefined { continue; }
-
-        if batch[$ "toRelaySeq"] != undefined && batch.toRelaySeq <= cursor {
-            try { file_delete(path); } catch (e) { }
-            continue;
-        }
-        if batch[$ "fromRelaySeq"] == undefined || batch.fromRelaySeq != cursor + 1 {
-            continue; // gap or already applied elsewhere; wait for the correct next batch
-        }
-
-        var events = batch.events;
-        var ok = true;
-        for (var ei = 0; ei < array_length(events); ei++) {
-            if !mp_inbox_apply_envelope(events[ei]) { ok = false; break; }
-            cursor = events[ei].relaySeq;
-        }
-
-        mp_inbox_write_cursor(cursor);
-        applied_any = true;
-        if !ok { break; } // stop at the first failure; leaves the batch for repair/replay
-        try { file_delete(path); } catch (e) { }
+    if batch[$ "fromRelaySeq"] == undefined || batch.fromRelaySeq != cursor + 1 {
+        return; // gap, or stale/ahead of what this client can safely apply next
     }
 
-    if applied_any {
-        var post = mp_grid_snapshot();
-        global.mp_grid_prev    = post.nodes;
-        global.mp_terr_prev_gk = post.gk;
-        global.mp_terr_prev_w  = post.w;
+    var events = batch.events;
+    var ok = true;
+    for (var ei = 0; ei < array_length(events); ei++) {
+        if !mp_inbox_apply_envelope(events[ei]) { ok = false; break; }
+        cursor = events[ei].relaySeq;
     }
+
+    mp_inbox_write_cursor(cursor);
+    if !ok { return; } // stop at the first failure; the batch stays put for repair/replay
+
+    var post = mp_grid_snapshot();
+    global.mp_grid_prev    = post.nodes;
+    global.mp_terr_prev_gk = post.gk;
+    global.mp_terr_prev_w  = post.w;
 }
 
 function mp_grid_snapshot() {

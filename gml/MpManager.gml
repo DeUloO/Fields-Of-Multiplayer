@@ -46,6 +46,7 @@ function mp_reset_session_state() {
     global.mp_outbox_pending    = [];
     global.mp_outbox_seg_seq    = 0;
     global.mp_outbox_seg_init   = false;
+    global.mp_outbox_segments   = [];
     global.mp_applied_relay_seq = 0;
     show_debug_message("[MOMI-MP] session state reset (ghosts + diff baselines cleared)");
 }
