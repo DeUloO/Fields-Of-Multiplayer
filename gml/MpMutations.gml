@@ -15,10 +15,13 @@ global.mp_outbox_seg_seq    = 0;
 global.mp_outbox_seg_init   = false;
 global.mp_outbox_segments   = [];
 global.mp_applied_relay_seq = 0;
+global.mp_inbox_gap_cursor  = -1;
+global.mp_inbox_gap_ticks   = 0;
 
 #macro MP_EV_HISTORY 320
 #macro MP_PROTOCOL_VERSION 2
 #macro MP_OUTBOX_MAX_BATCH 200
+#macro MP_INBOX_GAP_REPAIR_THRESHOLD 100
 
 // Fresh per boot/session-reset identity; invalidates stale clientSeq after a restart.
 function mp_generate_client_epoch() {
@@ -170,6 +173,41 @@ function mp_inbox_write_cursor(relay_seq) {
     save_json_file(mp_inbox_dir() + "/applied-cursor.json", { lastAppliedRelaySeq: relay_seq });
 }
 
+function mp_repair_request_path() {
+    return mp_dir() + "/mp_repair_request.json";
+}
+
+// Asks the relay to resync this client's inbox from its true applied cursor.
+function mp_request_repair(cursor, reason) {
+    try {
+        save_json_file(mp_repair_request_path(), {
+            playerId:       mp_player_id(),
+            reportedCursor: cursor,
+            reason:         reason,
+        });
+    } catch (e) {
+        show_debug_message("[MOMI-MP] repair request write failed: " + string(e));
+    }
+}
+
+// Tracks consecutive ticks stuck on the same batch; requests a relay-side resync past a threshold.
+function mp_inbox_note_gap(cursor) {
+    if global.mp_inbox_gap_cursor != cursor {
+        global.mp_inbox_gap_cursor = cursor;
+        global.mp_inbox_gap_ticks  = 0;
+    }
+    global.mp_inbox_gap_ticks++;
+    if global.mp_inbox_gap_ticks == MP_INBOX_GAP_REPAIR_THRESHOLD {
+        mp_request_repair(cursor, "inbox_gap");
+    }
+}
+
+function mp_inbox_clear_gap() {
+    global.mp_inbox_gap_ticks   = 0;
+    global.mp_inbox_gap_cursor  = -1;
+    try { file_delete(mp_repair_request_path()); } catch (e) { }
+}
+
 // Applies the pending batch only if it is exactly contiguous with the persisted cursor; never skips a gap.
 // A single fixed-name file is used the relay overwrites it
 // with the next range whenever the client's reported cursor advances past what it last published.
@@ -183,6 +221,7 @@ function mp_inbox_process() {
         return; // already applied; waiting for the relay to publish the next range
     }
     if batch[$ "fromRelaySeq"] == undefined || batch.fromRelaySeq != cursor + 1 {
+        mp_inbox_note_gap(cursor);
         return; // gap, or stale/ahead of what this client can safely apply next
     }
 
@@ -194,6 +233,7 @@ function mp_inbox_process() {
     }
 
     mp_inbox_write_cursor(cursor);
+    mp_inbox_clear_gap();
     if !ok { return; } // stop at the first failure; the batch stays put for repair/replay
 
     var post = mp_grid_snapshot();

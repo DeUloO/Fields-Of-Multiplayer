@@ -48,6 +48,9 @@ function mp_reset_session_state() {
     global.mp_outbox_seg_init   = false;
     global.mp_outbox_segments   = [];
     global.mp_applied_relay_seq = 0;
+    global.mp_inbox_gap_cursor  = -1;
+    global.mp_inbox_gap_ticks   = 0;
+    try { file_delete(mp_repair_request_path()); } catch (e) { }
     show_debug_message("[MOMI-MP] session state reset (ghosts + diff baselines cleared)");
 }
 
