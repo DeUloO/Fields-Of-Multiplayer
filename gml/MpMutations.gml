@@ -47,7 +47,7 @@ function mp_player_id() {
 
 // Placeholder world/session identity until host and joiners share a real handshake-negotiated id.
 function mp_session_id() {
-    return mp_player_id();
+    return global.mp_session_id;
 }
 
 function mp_zero_pad(n, width) {

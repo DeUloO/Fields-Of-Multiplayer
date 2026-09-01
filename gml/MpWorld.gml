@@ -225,6 +225,7 @@ function mp_world_apply(snapshot) {
         show_debug_message("[MOMI-MP] world snapshot rejected: host_pid == self (stale/own session)");
         return false;
     }
+    global.mp_session_id = string(snapshot.host_pid);
     if mp_is_host() {
         show_debug_message("[MOMI-MP] world snapshot rejected: we are the host, not a joiner");
         return false;
@@ -431,7 +432,7 @@ function mp_client_reset_watered() {
 
 function mp_world_tick() {
     if mp_is_host() {
-
+        global.mp_session_id = mp_player_id();
         var dump_trig = mp_dir() + "/mp_dump_world";
         if file_exists(dump_trig) {
             file_delete(dump_trig);
