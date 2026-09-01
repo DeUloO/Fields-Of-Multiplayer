@@ -33,8 +33,6 @@ function mp_reset_session_state() {
     global.mp_terr_prev_w  = undefined;
     global.mp_grid_loc     = -1;
     global.mp_ev_seq       = 0;
-    global.mp_ev_queue     = [];
-    global.mp_evseq_by_pid = {};
     global.mp_chest_prev   = {};
     global.mp_animal_prev  = {};
     global.mp_bldg_out     = {};
@@ -135,7 +133,6 @@ function mp_write_state() {
         ma:          mp_current_modifier(),
         att:         att,
         held:        mp_current_held(),
-        evs:         global.mp_ev_queue,
         cal:         CALENDAR.time,
         clk:         CLOCK.time,
         whost:       mp_is_host(),
@@ -157,7 +154,6 @@ function mp_read_state() {
     var players = data.players;
     for (var i = 0; i < array_length(players); i++) {
         mp_update_ghost(players[i]);
-        mp_apply_player_events(players[i]);
     }
 
     if !mp_is_host() {

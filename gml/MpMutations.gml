@@ -3,8 +3,6 @@ global.mp_terr_prev_gk = undefined;
 global.mp_terr_prev_w  = undefined;
 global.mp_grid_loc     = -1;
 global.mp_ev_seq       = 0;
-global.mp_ev_queue     = [];
-global.mp_evseq_by_pid = {};
 global.mp_chest_prev   = {};
 global.mp_animal_prev  = {};
 global.mp_bldg_out     = {};
@@ -18,7 +16,6 @@ global.mp_applied_relay_seq = 0;
 global.mp_inbox_gap_cursor  = -1;
 global.mp_inbox_gap_ticks   = 0;
 
-#macro MP_EV_HISTORY 320
 #macro MP_PROTOCOL_VERSION 2
 #macro MP_OUTBOX_MAX_BATCH 200
 #macro MP_INBOX_GAP_REPAIR_THRESHOLD 100
@@ -146,7 +143,7 @@ function mp_outbox_prune_acked() {
     }
 }
 
-// Applies one canonical envelope; mirrors mp_apply_player_events' per-kind dispatch.
+// Applies one canonical envelope;
 function mp_inbox_apply_envelope(envelope) {
     var ev = envelope.event;
     if ev.k == "astate" { return mp_apply_animal_state(ev); }
@@ -421,10 +418,6 @@ function mp_emit_event(ev) {
     ev.s = global.mp_ev_seq;
 
     ev.loc = CURRENT_LOCATION_ID;
-    array_push(global.mp_ev_queue, ev);
-    while (array_length(global.mp_ev_queue) > MP_EV_HISTORY) {
-        array_delete(global.mp_ev_queue, 0, 1);
-    }
 
     var pid = mp_player_id();
     mp_outbox_enqueue({
@@ -612,54 +605,6 @@ function mp_apply_animal_state(ev) {
         }
     }
     return true; // target building/stall not present on this client; nothing to reconcile
-}
-
-function mp_apply_player_events(state) {
-    if state[$ "evs"] == undefined { return; }
-    if state[$ "location_id"] == undefined { return; }
-
-    var pid = string(state.player_id);
-    var my_pid = string(ARI.name) + "|" + string(ARI.farm_name);
-    if pid == my_pid { return; }
-
-    if GRIDS == undefined { return; }
-    var fallback_loc = state.location_id;
-    var evs = state.evs;
-
-    if global.mp_evseq_by_pid[$ pid] == undefined {
-        var maxs = 0;
-        for (var i = 0; i < array_length(evs); i++) {
-            if evs[i].s > maxs { maxs = evs[i].s; }
-        }
-        global.mp_evseq_by_pid[$ pid] = maxs;
-        return;
-    }
-
-    var applied_current = false;
-    for (var i = 0; i < array_length(evs); i++) {
-        var ev = evs[i];
-        if ev.s <= global.mp_evseq_by_pid[$ pid] { continue; }
-        global.mp_evseq_by_pid[$ pid] = ev.s;
-
-        if ev.k == "astate" { mp_apply_animal_state(ev); continue; }
-        if ev.k == "bell"   { mp_apply_bell(ev); continue; }
-
-        var eloc = (ev[$ "loc"] != undefined) ? ev.loc : fallback_loc;
-        if eloc < 0 || eloc >= array_length(GRIDS) { continue; }
-        var egrid = GRIDS[eloc];
-        if egrid == undefined { continue; }
-        var e_is_current = (eloc == CURRENT_LOCATION_ID);
-
-        var did = mp_apply_event(egrid, ev, e_is_current);
-        if e_is_current && did { applied_current = true; }
-    }
-
-    if applied_current {
-        var post = mp_grid_snapshot();
-        global.mp_grid_prev    = post.nodes;
-        global.mp_terr_prev_gk = post.gk;
-        global.mp_terr_prev_w  = post.w;
-    }
 }
 
 function mp_apply_event(grid, ev, is_current) {

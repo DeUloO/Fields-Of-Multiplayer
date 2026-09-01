@@ -334,7 +334,6 @@ function mp_world_apply(snapshot) {
     GRID = GRIDS[CURRENT_LOCATION_ID];
 
     global.mp_grid_loc    = -1;
-    global.mp_ev_queue    = [];
     global.mp_items_prev  = undefined;
     global.mp_recv_pickup = {};
     global.mp_animal_prev = {};
